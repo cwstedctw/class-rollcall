@@ -512,3 +512,9 @@ test('第五輪：清掉測試場次——只清測試用成績簿已結束的�
   assert.equal(logRows(gas, '場次').length, rowsBefore, '紀錄表一列都不動');
   assert.equal(gas.as(TEACHER).call('clearTestSessions').removed, 0, '再按一次沒有東西可清');
 });
+
+test('老師頁在點名進行中提示成績簿什麼時候寫入', () => {
+  const { gas } = fresh();
+  const html = gas.as(TEACHER).page();
+  assert.ok(html.includes('結束點名後才會寫入成績簿'), '老師頁應該有寫入時機的提示');
+});
