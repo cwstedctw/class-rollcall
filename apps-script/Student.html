@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base target="_top">
+  <title>課堂簽到</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f2f6f4;
+      --paper: #fff;
+      --text: #172e2a;
+      --muted: #46605a;
+      --line: #b9cec6;
+      --accent: #096761;
+      --accent-text: #fff;
+      --good: #123d2f;
+      --good-bg: #d6f1e4;
+      --note: #634406;
+      --note-bg: #fbefcb;
+      --alert: #872a21;
+      --alert-bg: #fff0e9;
+      font: 16px/1.55 system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #112420;
+        --paper: #1c322c;
+        --text: #eff9f4;
+        --muted: #c2d9d0;
+        --line: #526d64;
+        --accent: #8be0ce;
+        --accent-text: #11342c;
+        --good: #cbf8e5;
+        --good-bg: #1d493a;
+        --note: #f6db8d;
+        --note-bg: #453b20;
+        --alert: #ffd3c8;
+        --alert-bg: #542a24;
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; color: var(--text); background: var(--bg); }
+    main { margin: 0 auto; width: min(100% - 2rem, 30rem); padding: 1.4rem 0 2rem; }
+    h1, h2, p, dl, dd { margin: 0; }
+    h1 { font-size: 1.4rem; margin-bottom: .8rem; }
+    h2 { font-size: clamp(1.55rem, 6.5vw, 2.35rem); line-height: 1.2; text-wrap: balance; }
+    #result, form { border-radius: .9rem; padding: clamp(.85rem, 4vw, 1.5rem); }
+    #result { background: var(--note-bg); color: var(--note); }
+    #result[data-tone="good"] { background: var(--good-bg); color: var(--good); }
+    #result[data-tone="alert"] { background: var(--alert-bg); color: var(--alert); }
+    #message { margin-top: .55rem; font-size: 1.1rem; }
+    dl { margin-top: .9rem; display: grid; gap: .5rem; font-size: 1.1rem; }
+    dl > div { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: .6rem; align-items: baseline; }
+    dt { font-size: 1rem; font-weight: 650; }
+    dd { overflow-wrap: anywhere; }
+    dd.timestamp { font-size: 1.55rem; font-weight: 750; font-variant-numeric: tabular-nums; }
+    form { display: grid; gap: .65rem; border: 1px solid var(--line); background: var(--paper); }
+    #result:not([hidden]) + form { margin-top: .8rem; }
+    label { font-size: 1.12rem; font-weight: 700; }
+    input, button { width: 100%; min-height: 3.15rem; border-radius: .5rem; }
+    input {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--line);
+      font: 700 1.65rem/1.25 ui-monospace, monospace;
+      letter-spacing: .1em;
+      padding: .55rem .7rem;
+      text-transform: uppercase;
+    }
+    button {
+      background: var(--accent);
+      color: var(--accent-text);
+      border: 1px solid var(--accent);
+      font: 700 1.15rem/1.25 system-ui, sans-serif;
+      cursor: pointer;
+    }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    button:disabled { opacity: .68; cursor: wait; }
+    #pending { color: var(--muted); }
+    #switch { margin-top: .9rem; display: grid; gap: .8rem; }
+    #switch ol { margin: 0; padding-left: 1.3rem; display: grid; gap: .45rem; font-size: 1.05rem; }
+    a.button {
+      display: block; text-align: center; text-decoration: none; border-radius: .5rem;
+      background: var(--accent); color: var(--accent-text); border: 1px solid var(--accent);
+      font: 700 1.15rem/1.25 system-ui, sans-serif; padding: .9rem .7rem;
+    }
+    .small { font-size: .95rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>課堂簽到</h1>
+    <div id="result" role="status" aria-live="polite" hidden>
+      <h2 id="heading"></h2>
+      <p id="message" hidden></p>
+      <dl id="details" hidden></dl>
+      <div id="switch" hidden>
+        <ol>
+          <li>按下面的「用東華帳號簽到」。</li>
+          <li>Google 請你選帳號時，選「學號@gms.ndhu.edu.tw」。清單裡沒有的話，按「使用其他帳戶」，用學號@gms.ndhu.edu.tw 登入。</li>
+          <li>登入後會回到簽到頁。如果出現「QR 過期」，輸入投影幕上的 6 碼就可以。</li>
+        </ol>
+        <a id="switch-link" class="button" target="_top" rel="noopener">用東華帳號簽到</a>
+        <p class="small">用 LINE 或其他 App 掃的話，請改用手機內建相機掃，或把網址用 Chrome、Safari 開啟。</p>
+      </div>
+    </div>
+    <form id="manual" hidden>
+      <label for="code">輸入投影幕上的 6 碼</label>
+      <input id="code" name="code" type="text" size="6" inputmode="text"
+        autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+      <button id="submit" type="submit">簽到</button>
+      <p id="pending" role="status" hidden>簽到處理中…</p>
+    </form>
+    <textarea id="initial-result" hidden readonly><?= JSON.stringify(initialResult) ?></textarea>
+  </main>
+
+  <script>
+    'use strict';
+
+    const byId = id => document.getElementById(id);
+    const element = (tag, text) => Object.assign(document.createElement(tag), {textContent: text});
+    const accountHint = '如果手機同時登入個人 Gmail，請改用只登入東華帳號的瀏覽器或無痕視窗，再掃一次。';
+    const results = {
+      unauthorized: {title: '請改用東華 Google 帳號', message: '這支手機現在用的 Google 帳號不是東華的，系統認不出你是誰，所以還沒簽到。', tone: 'alert'},
+      closed: {title: '這場點名已經結束', message: '現在已經不能簽到。需要補登請當面找老師。'},
+      wrong: {title: 'QR 過期或簽到碼有誤', message: '請重新掃投影幕上的 QR，或在下方輸入 6 碼。', allowManual: true},
+      duplicate: {title: '你已經簽到了', tone: 'good'},
+      cancelled: {title: '老師已將你這堂改為未到，請當面找老師。', tone: 'alert'},
+      notInRoster: {title: '你不在這門課的名冊上', message: '已記下來，請下課找老師。'},
+      success: {title: '簽到成功', tone: 'good'},
+      queued: {title: '排隊中，請稍候'},
+      busy: {title: '系統忙線，請再掃一次', allowManual: true},
+      teacherTest: {title: '老師測試：QR 有效，不記錄', tone: 'good'},
+      rateLimited: {title: '輸入錯誤次數過多', message: '請稍後再試，或請老師補登。', allowManual: true},
+      ambiguous: {title: '同時有多場點名使用這組碼', message: '請直接掃這門課投影幕上的 QR。', allowManual: true},
+      error: {title: '目前無法確認簽到', message: '請重新掃碼或在下方再試一次。', allowManual: true}
+    };
+
+    function detail(label, value, isTime = false) {
+      const row = document.createElement('div');
+      const description = element('dd', value);
+      if (isTime) description.className = 'timestamp';
+      row.append(element('dt', label), description);
+      return row;
+    }
+
+    function showResult(result, retryExhausted = false) {
+      const options = Object.prototype.hasOwnProperty.call(results, result.kind) ? results[result.kind] : results.error;
+      byId('result').hidden = result.kind === 'manual';
+      byId('manual').hidden = result.kind !== 'manual' && !options.allowManual;
+      if (result.kind === 'manual') return;
+
+      byId('result').dataset.tone = options.tone || 'note';
+      byId('heading').textContent = options.title;
+      const hint = retryExhausted ? accountHint : '';
+      const canSwitch = result.kind === 'unauthorized' && typeof result.switchUrl === 'string'
+        && /^https?:\/\//.test(result.switchUrl);
+      byId('switch').hidden = !canSwitch;
+      if (canSwitch) byId('switch-link').href = result.switchUrl;
+      const message = [options.message, hint].filter(Boolean).join(' ');
+      byId('message').textContent = message;
+      byId('message').hidden = !message;
+
+      const verified = result.kind === 'success' || result.kind === 'duplicate';
+      const details = byId('details');
+      const fields = [];
+      if (result.bookName) fields.push(detail('課程', result.bookName));
+      if (result.date) fields.push(detail('日期', result.date));
+      if (verified && result.time) {
+        fields.push(detail(result.kind === 'duplicate' ? '首次簽到' : '簽到時間', result.time, true));
+      }
+      if (result.kind === 'closed' && result.closeTime) fields.push(detail('結束時間', result.closeTime, true));
+      if (verified && result.sid) fields.push(detail('學號', result.sid));
+      if (verified && result.name) fields.push(detail('姓名', result.name));
+      if (result.kind === 'success' && result.status) fields.push(detail('狀態', result.status));
+      details.replaceChildren(...fields);
+      details.hidden = !fields.length;
+    }
+
+    function setPending(busy) {
+      byId('pending').hidden = !busy;
+      byId('submit').disabled = busy;
+      byId('code').readOnly = busy;
+    }
+
+    function requestCheckIn(code) {
+      return new Promise((resolve, reject) => {
+        google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).checkInByCode(code);
+      }).catch(() => ({kind: 'error'}));
+    }
+
+    function canRetry(result) {
+      return result.kind === 'busy' || result.kind === 'error';
+    }
+
+    async function retryCheckIn(code, result) {
+      if (code && canRetry(result)) {
+        showResult({kind: 'queued'});
+        for (let retries = 0; retries < 3 && canRetry(result); retries++) {
+          await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1000));
+          result = await requestCheckIn(code);
+        }
+      }
+      showResult(result, Boolean(code) && canRetry(result));
+    }
+
+    byId('manual').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (byId('submit').disabled) return;
+      const code = byId('code').value.replace(/\s/g, '').toUpperCase();
+      setPending(true);
+      try {
+        await retryCheckIn(code, await requestCheckIn(code));
+      } finally {
+        setPending(false);
+      }
+      if (!byId('manual').hidden) byId('code').select();
+    });
+
+    const initial = byId('initial-result');
+    try {
+      const result = JSON.parse(initial.value);
+      if (canRetry(result)) {
+        showResult({kind: 'queued'});
+        google.script.url.getLocation(location => retryCheckIn(location?.parameter?.k, result));
+      } else {
+        showResult(result);
+      }
+    } catch (error) {
+      showResult({kind: 'error'});
+    } finally {
+      initial.remove();
+    }
+  </script>
+</body>
+</html>

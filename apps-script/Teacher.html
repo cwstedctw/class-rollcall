@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base target="_top">
+  <title>課堂點名</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f2f6f4;
+      --paper: #fff;
+      --text: #172e2a;
+      --muted: #46605a;
+      --line: #b9cec6;
+      --accent: #096761;
+      --accent-text: #fff;
+      --alert: #872a21;
+      --alert-bg: #fff0e9;
+      --note: #634406;
+      --note-bg: #fbefcb;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #112420;
+        --paper: #1c322c;
+        --text: #eff9f4;
+        --muted: #c2d9d0;
+        --line: #526d64;
+        --accent: #8be0ce;
+        --accent-text: #11342c;
+        --alert: #ffd3c8;
+        --alert-bg: #542a24;
+        --note: #f6db8d;
+        --note-bg: #453b20;
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    main { width: min(100% - 2rem, 66rem); margin: 0 auto; padding: 1.25rem 0 2rem; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(1.6rem, 4vw, 2.35rem); line-height: 1.15; }
+    h2 { font-size: 1.25rem; }
+    h3 { font-size: 1rem; }
+    header, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: .625rem; }
+    header { justify-content: space-between; margin-bottom: 1.1rem; }
+    button, input, select { font: inherit; }
+    button, input, select { border: 1px solid var(--line); border-radius: .5rem; }
+    input, select { width: 100%; padding: .625rem; color: var(--text); background: var(--paper); }
+    button {
+      min-height: 2.75rem;
+      padding: .5rem .875rem;
+      background: var(--paper);
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button.primary { color: var(--accent-text); background: var(--accent); border-color: var(--accent); }
+    button.end { color: var(--alert); }
+    button:disabled { cursor: default; opacity: .55; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    label { display: grid; gap: .25rem; font-weight: 600; }
+    .stack { display: grid; gap: .9rem; }
+    .card { border: 1px solid var(--line); border-radius: .85rem; background: var(--paper); padding: 1rem; }
+    .columns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; align-items: start; }
+    .notice { border-radius: .5rem; padding: .65rem .85rem; background: var(--note-bg); color: var(--note); }
+    .problem { border-radius: .5rem; padding: .65rem .85rem; background: var(--alert-bg); color: var(--alert); }
+    #problem { margin-bottom: .75rem; }
+    #projection {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: clamp(.7rem, 2vw, 2rem);
+    }
+    #qr-frame {
+      display: grid;
+      place-items: center;
+      width: min(100%, 60vh);
+      aspect-ratio: 1;
+      background: #fff;
+      color-scheme: light;
+    }
+    #qr { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+    #readout { text-align: center; }
+    #code, #countdown { font-variant-numeric: tabular-nums; line-height: 1.05; }
+    #code { font-family: ui-monospace, monospace; font-size: clamp(2.25rem, 7vw, 5.6rem); font-weight: 750; letter-spacing: .06em; }
+    #countdown { font-size: clamp(2rem, 5vw, 4rem); font-weight: 650; margin: .5rem 0; }
+    #attendance { font-size: clamp(1.1rem, 2.5vw, 1.75rem); font-weight: 700; }
+    #date { color: var(--muted); }
+    #session-title { overflow-wrap: anywhere; }
+    .session-link { text-align: left; }
+    .roster-entry {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: .4rem .8rem;
+      padding: .5rem 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .roster-list { margin: 0; padding: 0; list-style: none; }
+    dialog { max-width: min(28rem, 100% - 2rem); color: var(--text); }
+    dialog::backdrop { background: #112420ad; }
+    @media (max-width: 40rem) {
+      .columns { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>課堂點名</h1>
+      <button type="button" id="back" hidden>回到課程</button>
+    </header>
+    <p class="problem" id="problem" role="alert" hidden></p>
+
+    <section id="home" class="stack" aria-label="課程設定">
+      <p id="boot-status" role="status">載入課程中…</p>
+      <button type="button" id="reload" hidden>重新載入課程</button>
+      <div class="card stack" id="open-panel" hidden>
+        <h2>進行中的點名</h2>
+        <div class="actions" id="open-sessions"></div>
+      </div>
+      <div class="card stack" id="closed-panel" hidden>
+        <h2>已結束的點名</h2>
+        <div class="actions" id="closed-sessions"></div>
+        <button type="button" id="clear-tests" hidden>清掉測試場次</button>
+      </div>
+
+      <form id="start-form" class="card stack" hidden>
+        <label>課程
+          <select id="course" required></select>
+        </label>
+        <div class="columns">
+          <div class="stack">
+            <label>開放幾分鐘
+              <select id="duration">
+                <option value="3">3 分鐘</option>
+                <option value="5" selected>5 分鐘</option>
+                <option value="10">10 分鐘</option>
+                <option value="15">15 分鐘</option>
+                <option value="custom">自訂</option>
+              </select>
+            </label>
+            <label id="custom-label" hidden>自訂分鐘數（1–180）
+              <input type="number" id="custom-duration" min="1" max="180" value="5">
+            </label>
+          </div>
+          <label>QR 多久換一次
+            <select id="rotation">
+              <option value="0">不換</option>
+              <option value="20" selected>20 秒</option>
+              <option value="60">60 秒</option>
+            </select>
+          </label>
+          <label>幾分鐘後算遲到（0 表示不分）
+            <input type="number" id="late" min="0" value="0" required>
+          </label>
+        </div>
+        <div><button type="submit" class="primary" id="start">開始點名</button></div>
+      </form>
+
+      <details id="setup-panel" class="card" hidden>
+        <summary>成績簿與點名紀錄設定</summary>
+        <div class="stack" style="margin-top: .75rem">
+          <p id="folder-hint" class="notice" hidden></p>
+          <form id="folder-form" class="stack">
+            <label>成績簿資料夾網址
+              <input type="text" id="folder" placeholder="貼上雲端硬碟資料夾網址" required>
+            </label>
+            <div><button type="submit" id="save-folder">儲存資料夾</button></div>
+          </form>
+          <div class="actions">
+            <button type="button" id="setup">建立點名紀錄表</button>
+            <button type="button" id="demo">建立測試用成績簿</button>
+          </div>
+          <p id="setup-status" role="status" hidden></p>
+        </div>
+      </details>
+    </section>
+
+    <section id="session" class="stack" aria-labelledby="session-title" hidden>
+      <div>
+        <h2 id="session-title"></h2>
+        <p id="date"></p>
+      </div>
+      <p id="warning" class="notice" hidden></p>
+      <div id="projection">
+        <div id="qr-frame">
+          <canvas id="qr" role="img" aria-label="簽到 QR 碼"></canvas>
+        </div>
+        <div id="readout">
+          <p id="code" aria-label="手動簽到碼"></p>
+          <p id="countdown" role="timer" aria-label="剩餘時間"></p>
+          <p id="attendance"></p>
+          <p id="qr-error" class="problem" hidden>QR 無法顯示，請用畫面上的 6 碼手動簽到。</p>
+        </div>
+      </div>
+      <div id="closed" class="card stack" hidden>
+        <h3>點名已結束</h3>
+        <p id="closed-attendance"></p>
+        <p id="write-result" role="status"></p>
+        <p id="write-error" class="problem" role="alert" hidden></p>
+      </div>
+      <div class="actions">
+        <button type="button" id="extend">延長 2 分鐘</button>
+        <button type="button" id="end" class="end">結束點名</button>
+        <button type="button" id="top-up" class="primary" hidden></button>
+        <button type="button" id="show-roster" aria-expanded="false" aria-controls="roster">看名單</button>
+      </div>
+      <section id="roster" class="card stack" aria-label="點名名單" hidden></section>
+    </section>
+
+    <dialog id="roster-confirm" class="card" aria-labelledby="roster-confirm-title">
+      <form method="dialog" class="stack">
+        <h2 id="roster-confirm-title">看名單</h2>
+        <p>名單含學生姓名，投影中請先切掉畫面。</p>
+        <div class="actions">
+          <button value="cancel" autofocus>返回</button>
+          <button value="show" class="primary">確認看名單</button>
+        </div>
+      </form>
+    </dialog>
+  </main>
+
+  <?!= include_('QrLib') ?>
+  <script>
+    'use strict';
+
+    const byId = id => document.getElementById(id);
+    const element = (tag, text) => Object.assign(document.createElement(tag), {textContent: text});
+    const rpc = (method, ...args) => new Promise((resolve, reject) => {
+      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[method](...args);
+    });
+
+    const qr = byId('qr');
+    let active = null;
+    let rosterVisible = false;
+    let working = false;
+    let ticking = false;
+    let pollError = false;
+    let clockAt = 0;
+    let qrUrl = '';
+    let qrMatrix = null;
+    let qrReady = false;
+
+    function notice(id, message) {
+      const output = byId(id);
+      output.textContent = message || '';
+      output.hidden = !message;
+    }
+
+    function problem(error, fromPoll = false) {
+      pollError = fromPoll;
+      notice('problem', error ? (error.message || String(error)) : '');
+    }
+
+    function updateControls() {
+      document.querySelectorAll('button').forEach(button => { button.disabled = working; });
+    }
+
+    async function action(task) {
+      if (working) return;
+      working = true;
+      updateControls();
+      problem();
+      try {
+        await task();
+      } catch (error) {
+        problem(error);
+      } finally {
+        working = false;
+        updateControls();
+      }
+    }
+
+    function listSessions(id, sessions) {
+      byId(id).replaceChildren(...sessions.map(session => {
+        const button = element('button', session.bookName + ' ' + session.date);
+        button.type = 'button';
+        button.className = 'session-link';
+        button.addEventListener('click', () => action(async () => {
+          showSession(await rpc('teacherTick', session.id));
+        }));
+        return button;
+      }));
+    }
+
+    function showOptions(defaults) {
+      const isPreset = [3, 5, 10, 15].includes(defaults.durationMin);
+      byId('duration').value = isPreset ? defaults.durationMin : 'custom';
+      byId('custom-duration').value = defaults.durationMin;
+      byId('rotation').value = defaults.rotateSec;
+      byId('late').value = defaults.lateAfterMin;
+      toggleCustomDuration();
+    }
+
+    function toggleCustomDuration() {
+      const isCustom = byId('duration').value === 'custom';
+      byId('custom-label').hidden = !isCustom;
+      byId('custom-duration').disabled = !isCustom;
+      byId('custom-duration').required = isCustom;
+    }
+
+    async function loadHome(selectedId) {
+      notice('boot-status', '載入課程中…');
+      byId('reload').hidden = true;
+      let data;
+      try {
+        data = await rpc('teacherBoot');
+      } catch (error) {
+        notice('boot-status', '課程載入失敗。');
+        byId('reload').hidden = false;
+        throw error;
+      }
+
+      const select = byId('course');
+      const preferred = selectedId || select.value;
+      const placeholder = element('option', '選擇課程');
+      placeholder.value = '';
+      select.replaceChildren(placeholder, ...data.courses.map(course => {
+        const option = element('option', course.name);
+        option.value = course.id;
+        return option;
+      }));
+      const preferredExists = data.courses.some(course => course.id === preferred);
+      select.value = preferredExists ? preferred : (data.courses.length === 1 ? data.courses[0].id : '');
+      showOptions(data.defaults);
+      byId('start-form').hidden = !data.courses.length;
+      listSessions('open-sessions', data.openSessions);
+      listSessions('closed-sessions', data.closedSessions);
+      byId('open-panel').hidden = !data.openSessions.length;
+      byId('closed-panel').hidden = !data.closedSessions.length;
+      const testCount = data.testSessionCount || 0;
+      byId('clear-tests').hidden = !testCount;
+      byId('clear-tests').textContent = '清掉測試用成績簿的 ' + testCount + ' 場（點名紀錄表不會動）';
+      byId('setup-panel').hidden = false;
+      if (data.needsGradeFolder || data.folderError || !data.courses.length) byId('setup-panel').open = true;
+      notice('folder-hint', data.folderError || (data.needsGradeFolder ? '貼上成績簿資料夾網址，或先建立測試用成績簿。' : ''));
+      notice('boot-status', !data.courses.length && !data.needsGradeFolder && !data.folderError ? '資料夾裡沒有可選的成績簿。' : '');
+    }
+
+    function drawQR() {
+      if (!qrMatrix || byId('projection').hidden) return;
+      const side = byId('qr-frame').clientWidth;
+      if (!side) return;
+      const modules = qrMatrix.getModuleCount();
+      const square = modules + 8;
+      const requested = Math.round(side * (window.devicePixelRatio || 1));
+      const scale = Math.max(1, Math.floor(requested / square));
+      const size = square * scale;
+      qr.width = qr.height = size;
+      const context = qr.getContext('2d');
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, size, size);
+      context.fillStyle = '#000';
+      for (let row = 0; row < modules; row++) {
+        for (let col = 0; col < modules; col++) {
+          if (qrMatrix.isDark(row, col)) context.fillRect((col + 4) * scale, (row + 4) * scale, scale, scale);
+        }
+      }
+    }
+
+    function updateQR(url) {
+      if (qrReady && qrUrl === url) return;
+      qrUrl = url;
+      qrReady = true;
+      qrMatrix = null;
+      byId('qr-frame').hidden = true;
+      byId('qr-error').hidden = true;
+      try {
+        if (!url) throw new Error('缺少簽到連結。');
+        const matrix = qrcode(0, 'M');
+        matrix.addData(url);
+        matrix.make();
+        qrMatrix = matrix;
+      } catch (error) {
+        byId('qr-error').hidden = false;
+      }
+      byId('qr-frame').hidden = !qrMatrix;
+      drawQR();
+    }
+
+    function updateClock() {
+      if (active?.status !== 'open') return;
+      const estimatedNow = active.serverNowMs + performance.now() - clockAt;
+      const seconds = Math.max(0, Math.ceil((active.closesAtMs - estimatedNow) / 1000));
+      const display = String(Math.floor(seconds / 60)).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0');
+      if (byId('countdown').textContent !== display) byId('countdown').textContent = display;
+    }
+
+    function setRosterVisible(visible) {
+      rosterVisible = visible;
+      byId('roster').hidden = !visible;
+      if (!visible) byId('roster').replaceChildren();
+      const button = byId('show-roster');
+      button.textContent = visible ? '關閉名單' : '看名單';
+      button.setAttribute('aria-expanded', String(visible));
+      byId('projection').hidden = active?.status !== 'open' || visible;
+      if (!visible) drawQR();
+    }
+
+    function writeOutcome(session) {
+      const messages = {
+        filled: '已寫入成績簿的日期欄。',
+        missing: '成績簿缺少這一欄，簽到結果保留在點名紀錄表。',
+        occupied: session.upgradeCount
+          ? '成績簿這一欄已有資料。有 ' + session.upgradeCount + ' 位出席者仍是 0 或空白。'
+          : '成績簿這一欄已有資料。目前沒有需要補成 1 的出席者。',
+        topped: '已把符合條件的出席者補成 1。',
+        error: '成績簿寫入未能確認；請核對點名紀錄表與寫入備份。'
+      };
+      return messages[session.written] || '等候寫入結果。';
+    }
+
+    function showSession(session) {
+      const switching = active?.id !== session.id || active?.status !== session.status;
+      active = session;
+      clockAt = performance.now();
+      byId('home').hidden = true;
+      byId('session').hidden = false;
+      byId('back').hidden = false;
+      if (switching) setRosterVisible(false);
+      const isOpen = session.status === 'open';
+      byId('session-title').textContent = session.bookName;
+      byId('date').textContent = session.date;
+      byId('projection').hidden = !isOpen || rosterVisible;
+      byId('closed').hidden = isOpen;
+      byId('extend').hidden = !isOpen;
+      byId('end').hidden = !isOpen;
+      byId('top-up').hidden = isOpen || session.written !== 'occupied' || !session.upgradeCount;
+      notice('warning', isOpen ? session.warning : '');
+
+      const attendance = '已簽到 ' + session.presentCount + '／名冊 ' + session.rosterCount;
+      byId('attendance').textContent = attendance;
+      if (isOpen) {
+        byId('code').textContent = session.code;
+        updateQR(session.qrUrl);
+        updateClock();
+        return;
+      }
+
+      byId('code').textContent = '';
+      byId('closed-attendance').textContent = attendance;
+      byId('write-result').textContent = writeOutcome(session);
+      const rows = session.mismatches?.length ? '回讀不符的試算表列：' + session.mismatches.join('、') + '。' : '';
+      notice('write-error', [session.error, rows].filter(Boolean).join(' '));
+      byId('top-up').textContent = '把這 ' + session.upgradeCount + ' 位補成 1';
+    }
+
+    async function loadRoster() {
+      const id = active.id;
+      const result = await rpc('sessionRoster', id);
+      if (!rosterVisible || active?.id !== id) return;
+      const entries = result.list;
+      byId('roster').replaceChildren(
+        rosterGroup('已到', entries.filter(entry => entry.present)),
+        rosterGroup('未到', entries.filter(entry => !entry.present))
+      );
+    }
+
+    function rosterGroup(title, entries) {
+      const group = document.createElement('div');
+      group.append(element('h3', title + '（' + entries.length + '）'));
+      const list = element('ul', '');
+      list.className = 'roster-list';
+      entries.forEach(entry => {
+        const item = element('li', '');
+        item.className = 'roster-entry';
+        const details = [entry.sid, entry.name, entry.present ? entry.status : '', entry.present ? entry.time : ''];
+        item.append(element('span', details.filter(Boolean).join('　')));
+        const button = element('button', entry.present ? '改為未到' : '改為出席');
+        button.type = 'button';
+        button.addEventListener('click', () => action(async () => {
+          showSession(await rpc('teacherMark', active.id, entry.sid, !entry.present));
+          if (rosterVisible) await loadRoster();
+        }));
+        item.append(button);
+        list.append(item);
+      });
+      group.append(list);
+      return group;
+    }
+
+    byId('duration').addEventListener('change', toggleCustomDuration);
+    byId('reload').addEventListener('click', () => action(() => loadHome()));
+    byId('clear-tests').addEventListener('click', () => action(async () => {
+      await rpc('clearTestSessions');
+      await loadHome();
+    }));
+    byId('start-form').addEventListener('submit', event => {
+      event.preventDefault();
+      action(async () => {
+        const duration = byId('duration').value;
+        showSession(await rpc('startSession', byId('course').value, {
+          durationMin: Number(duration === 'custom' ? byId('custom-duration').value : duration),
+          rotateSec: Number(byId('rotation').value),
+          lateAfterMin: Number(byId('late').value)
+        }));
+      });
+    });
+    byId('folder-form').addEventListener('submit', event => {
+      event.preventDefault();
+      action(async () => {
+        await rpc('saveGradeFolder', byId('folder').value);
+        byId('folder').value = '';
+        notice('setup-status', '已儲存成績簿資料夾。');
+        await loadHome();
+      });
+    });
+    byId('setup').addEventListener('click', () => action(async () => {
+      await rpc('setup');
+      notice('setup-status', '點名紀錄表已就緒。');
+    }));
+    byId('demo').addEventListener('click', () => action(async () => {
+      const book = await rpc('createDemoBook');
+      notice('setup-status', '已建立測試用成績簿。');
+      await loadHome(book.id);
+    }));
+    byId('back').addEventListener('click', () => action(async () => {
+      active = null;
+      setRosterVisible(false);
+      byId('session').hidden = true;
+      byId('back').hidden = true;
+      byId('top-up').hidden = true;
+      byId('home').hidden = false;
+      await loadHome();
+    }));
+    byId('extend').addEventListener('click', () => action(async () => {
+      showSession(await rpc('extendSession', active.id, 2));
+    }));
+    byId('end').addEventListener('click', () => action(async () => {
+      showSession(await rpc('closeSession', active.id));
+    }));
+    byId('top-up').addEventListener('click', () => action(async () => {
+      showSession(await rpc('applyTopUp', active.id));
+    }));
+    const rosterConfirmation = byId('roster-confirm');
+    byId('show-roster').addEventListener('click', () => {
+      if (rosterVisible) {
+        setRosterVisible(false);
+      } else {
+        rosterConfirmation.returnValue = 'cancel';
+        rosterConfirmation.showModal();
+      }
+    });
+    rosterConfirmation.addEventListener('close', () => {
+      if (rosterConfirmation.returnValue !== 'show') return;
+      action(async () => {
+        setRosterVisible(true);
+        try {
+          await loadRoster();
+        } catch (error) {
+          setRosterVisible(false);
+          throw error;
+        }
+      });
+    });
+
+    window.addEventListener('resize', drawQR);
+    setInterval(updateClock, 250);
+    setInterval(async () => {
+      if (working || ticking || active?.status !== 'open') return;
+      const previous = active;
+      ticking = true;
+      try {
+        const session = await rpc('teacherTick', previous.id);
+        if (!working && active === previous) {
+          if (pollError) problem();
+          showSession(session);
+        }
+      } catch (error) {
+        if (!working && active === previous) problem(error, true);
+      } finally {
+        ticking = false;
+      }
+    }, 4000);
+    action(() => loadHome());
+  </script>
+</body>
+</html>
