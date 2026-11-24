@@ -109,6 +109,79 @@ function presentSet_(checkins) {
   return present;
 }
 
+/**
+ * 老師最後一次手動決定是「取消」的學號（2026-11-24 即時寫入用）。
+ * 判法與 presentSet_ 同一套：老師取消之後，學生自己再掃不算數，只有老師補登能改回來。
+ */
+function cancelledSids_(checkins) {
+  const cancelled = new Set();
+  for (const checkin of checkins) {
+    const sid = normSid_(checkin.sid);
+    if (!sid) continue;
+    if (checkin.status === '老師取消') cancelled.add(sid);
+    else if (checkin.status === '老師補登') cancelled.delete(sid);
+  }
+  return cancelled;
+}
+
+/** 成績簿日期欄一格的狀態：blank 空白、zero 0、one 1、other 其他內容（文字、公式、別的數字）。 */
+function cellState_(value) {
+  if (blankCell_(value)) return 'blank';
+  if (value === 0 || value === '0') return 'zero';
+  if (value === 1 || value === '1') return 'one';
+  return 'other';
+}
+
+/**
+ * 即時寫入的場次，日期欄每一格該改成什麼（只算，不寫）。
+ *   出席 → 1；老師取消 → 0；沒簽到的人平常不動，結束點名（final）時空白補成 0。
+ *   沒簽到、格子卻是 1＝老師自己在試算表填的，保留不動（kept 計數）。
+ *   格子是 0、1、空白以外的內容一律不碰（blocked 記下列號）。
+ */
+function liveChanges_(rows, col, roster, present, cancelled, final) {
+  const changes = [];
+  const blocked = [];
+  let kept = 0;
+  let ones = 0;
+  roster.forEach(person => {
+    const state = cellState_(rows[person.row][col]);
+    if (state === 'other') {
+      blocked.push(person.row);
+      return;
+    }
+    let target = null;
+    if (hasAttendance_(present, person.sid)) target = 1;
+    else if (cancelled.has(person.sid)) target = 0;
+    else if (final && state === 'blank') target = 0;
+    else if (state === 'one') kept++;
+    const already = target === 1 ? state === 'one' : state === 'zero';
+    if (target !== null && !already) changes.push({ row: person.row, value: target });
+    if (target === 1) ones++;
+  });
+  return { changes, blocked, kept, ones };
+}
+
+/** 「名冊上誰出席、誰被老師取消」的指紋；跟上次寫進成績簿時的不一樣，就代表有東西還沒寫。 */
+function liveSignature_(roster, present, cancelled) {
+  const here = roster.filter(person => hasAttendance_(present, person.sid)).map(person => person.sid);
+  const gone = roster.filter(person => !hasAttendance_(present, person.sid) && cancelled.has(person.sid))
+    .map(person => person.sid);
+  const text = here.join(',') + '|' + gone.join(',');
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
+  return here.length + ':' + gone.length + ':' + hash.toString(36);
+}
+
+/** 給畫面看的雙語訊息：第一行中文、第二行英文。每則訊息固定兩行，訊息之間也用換行接。 */
+function bi_(zh, en) {
+  return zh + '\n' + en;
+}
+
+/** 從雙語訊息取出中文那幾行（寫進點名紀錄試算表的備註用）。 */
+function zhOnly_(text) {
+  return String(text == null ? '' : text).split('\n').filter((_, index) => index % 2 === 0).join(' ');
+}
+
 function planColumnWrite_(headerRow, rows, dateStr, present) {
   const col = findDateColumn_(headerRow, dateStr);
   if (col < 0) return { kind: 'missing' };

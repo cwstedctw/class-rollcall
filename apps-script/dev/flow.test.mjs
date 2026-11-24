@@ -14,6 +14,7 @@ const SERVICE_URL = 'http://127.0.0.1:8918/';
 const TEACHER_FUNCTIONS = [
   'teacherBoot', 'saveGradeFolder', 'startSession', 'teacherTick', 'extendSession',
   'closeSession', 'sessionRoster', 'teacherMark', 'applyTopUp', 'createDemoBook', 'setup', 'clearTestSessions',
+  'syncLive',
 ];
 
 function fresh() {
@@ -512,3 +513,304 @@ test('第五輪：清掉測試場次——只清測試用成績簿已結束的�
   assert.equal(logRows(gas, '場次').length, rowsBefore, '紀錄表一列都不動');
   assert.equal(gas.as(TEACHER).call('clearTestSessions').removed, 0, '再按一次沒有東西可清');
 });
+
+// ───────── 第六輪（2026-11-24，Ted：「add english as bilingual version, add immediate update google sheet function, chk the performance to be more fast」） ─────────
+
+const sync = (gas, session) => gas.as(TEACHER).call('syncLive', session.id);
+const tick = (gas, session) => gas.as(TEACHER).call('teacherTick', session.id);
+const mark = (gas, session, sid, present) => gas.as(TEACHER).call('teacherMark', session.id, sid, present);
+const BLANKS = ['', '', '', '', '', '', '', ''];
+
+test('第六輪 即時寫入：掃完碼、老師頁背景同步一次，成績簿那一格就是 1；沒簽到的格子留白到結束才補 0', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const before = without(grade(), col);
+  const session = start(gas, bookId);
+  assert.equal(session.live, true, '當天欄整欄空白，這一場要即時寫入');
+  assert.equal(session.syncPending, false);
+  assert.equal(tick(gas, session).syncPending, false, '沒有人簽到就沒有東西要寫');
+
+  scan(gas, 'S0000001', session);
+  scan(gas, 'S0000003', session);
+  const pending = tick(gas, session);
+  assert.equal(pending.syncPending, true, '有簽到還沒進成績簿，老師頁要收到旗標');
+  assert.equal(pending.presentCount, 2);
+  assert.deepEqual(column(grade(), col), BLANKS, '學生掃碼那條路不寫成績簿，同步之前一格都不動');
+
+  const synced = sync(gas, session);
+  assert.equal(synced.liveSynced, 2);
+  assert.equal(synced.syncPending, false);
+  assert.equal(synced.liveError, '');
+  assert.deepEqual(column(grade(), col), [1, '', 1, '', '', '', '', ''], '寫的是數字 1，沒簽到的人維持空白');
+  assert.equal(without(grade(), col), before, '當天欄以外一格都不動（含合計公式）');
+  assert.equal(tick(gas, session).syncPending, false, '寫完之後旗標要放下');
+
+  const backups = logRows(gas, '寫入備份').length;
+  assert.equal(backups, 1, '每一次寫成績簿都留一筆備份');
+  assert.equal(sync(gas, session).liveSynced, 2);
+  assert.equal(logRows(gas, '寫入備份').length, backups, '沒有新簽到再同步，不寫也不多留備份');
+
+  scan(gas, 'S0000005', session);
+  const closed = gas.as(TEACHER).call('closeSession', session.id);
+  assert.equal(closed.written, 'filled', closed.error);
+  assert.equal(closed.error, '');
+  assert.equal(closed.presentCount, 3);
+  assert.deepEqual(column(grade(), col), [1, 0, 1, 0, 1, 0, 0, 0], '結束時把還空著的補成 0、最後一位補成 1');
+  assert.equal(without(grade(), col), before);
+  logRows(gas, '寫入備份').forEach((row) => assert.equal(row[6], '相符'));
+  assert.equal(sync(gas, session), null, '場次結束後背景同步不再做事');
+});
+
+test('第六輪 即時寫入：點名進行中老師取消或補登，按鈕先回來、下一次背景同步就把那一格改好', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const session = start(gas, bookId);
+  scan(gas, 'S0000001', session);
+  sync(gas, session);
+  assert.equal(grade()[1][col], 1);
+
+  const backups = logRows(gas, '寫入備份').length;
+  const used = gas.countCalls();
+  const cancelled = mark(gas, session, 'S0000001', false);
+  assert.equal(used().propsWrite, 0, '進行中改一位學生不必存場次狀態');
+  assert.equal(grade()[1][col], 1, '按鈕這一趟不寫成績簿（真環境實測當場寫要 5 秒），交給背景同步');
+  assert.equal(logRows(gas, '寫入備份').length, backups);
+  assert.equal(cancelled.presentCount, 0);
+  assert.equal(cancelled.syncPending, true, '回給老師頁的資料要帶旗標，老師頁才會馬上去同步');
+  assert.equal(sync(gas, session).syncPending, false);
+  assert.equal(grade()[1][col], 0, '老師取消，同步後那一格變 0');
+  assert.equal(scan(gas, 'S0000001', session).kind, 'cancelled');
+  assert.equal(tick(gas, session).syncPending, false, '被取消的人自己再掃，不會讓成績簿又變回 1');
+
+  assert.equal(mark(gas, session, 'S0000001', true).presentCount, 1);
+  mark(gas, session, 'S0000002', true);
+  sync(gas, session);
+  assert.equal(grade()[1][col], 1, '老師補登改回 1');
+  assert.equal(grade()[2][col], 1, '沒掃碼、老師直接補登的人也寫入');
+
+  mark(gas, session, 'S0000003', true);
+  const closed = gas.as(TEACHER).call('closeSession', session.id);
+  assert.equal(closed.written, 'filled', closed.error);
+  assert.deepEqual(column(grade(), col), [1, 1, 1, 0, 0, 0, 0, 0], '還沒輪到背景同步就結束，結束時一樣補齊');
+  mark(gas, session, 'S0000002', false);
+  assert.equal(grade()[2][col], 0, '結束之後老師再改，照舊當場只動那一格');
+  assert.deepEqual(column(grade(), col), [1, 0, 1, 0, 0, 0, 0, 0]);
+});
+
+test('第六輪 即時寫入：老師自己在試算表填的 1 保留；格子裡是別的內容就不覆蓋，結束時提醒', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const session = start(gas, bookId);
+  scan(gas, 'S0000001', session);
+  sync(gas, session);
+
+  grade()[2][col] = 1;        // 老師看著試算表，手動幫第 2 位填 1（手機沒電）
+  grade()[3][col] = '請假';   // 第 3 位那一格寫了別的字
+  scan(gas, 'S0000003', session);
+  const synced = sync(gas, session);
+  assert.equal(synced.liveError, '', '格子裡有別的內容不是錯誤，只是不覆蓋');
+  assert.equal(synced.liveBlocked, 1, '投影頁要講出有幾格沒寫進去');
+  assert.equal(grade()[3][col], '請假');
+  assert.equal(tick(gas, session).syncPending, false, '寫不進去的那一格不會讓老師頁一直重試');
+
+  const closed = gas.as(TEACHER).call('closeSession', session.id);
+  assert.equal(closed.written, 'filled');
+  assert.deepEqual(column(grade(), col), [1, 1, '請假', 0, 0, 0, 0, 0]);
+  assert.equal(closed.keptManual, 1, '手動填的 1 保留，並告訴老師有幾格');
+  assert.deepEqual(closed.mismatches, [4], '告訴老師是試算表第幾列');
+  assert.match(closed.error, /1 格已經是別的內容/);
+
+  // 立霧複驗 #4：結束後老師在網頁改這位學生，那一格的「請假」一樣不能被蓋掉
+  const backups = logRows(gas, '寫入備份').length;
+  const marked = mark(gas, session, 'S0000003', false);
+  assert.equal(grade()[3][col], '請假');
+  assert.equal(marked.written, 'filled', '擋下這一格不該把整場標成寫入失敗');
+  assert.deepEqual(marked.mismatches, [4]);
+  assert.match(marked.error, /沒有覆蓋；紀錄已記下/);
+  assert.equal(logRows(gas, '寫入備份').length, backups, '沒寫就不留備份');
+  assert.equal(logRows(gas, '簽到').at(-1)[6], '老師取消', '老師的決定仍然記進紀錄表');
+  mark(gas, session, 'S0000004', true);
+  assert.equal(grade()[4][col], 1, '其他學生照常能改');
+});
+
+test('第六輪（立霧複驗 #6）：結束後老師在成績簿加了一位學生，網頁補登找得到人', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const session = start(gas, bookId);
+  scan(gas, 'S0000001', session);
+  gas.as(TEACHER).call('closeSession', session.id);
+  grade().push(['S0000009', '測試學生 9', '', '', '', '=SUM(C10:E10)']);
+  const marked = mark(gas, session, 'S0000009', true);
+  assert.equal(marked.written, 'filled', marked.error);
+  assert.equal(grade()[9][col], 1);
+  gas.advance(11 * 60_000);
+  assert.equal(gas.as(TEACHER).call('sessionRoster', session.id).total, 9, '名冊快取只留 10 分鐘，之後老師頁看得到新加的人');
+});
+
+test('第六輪 即時寫入：名冊順序被重排，下一次同步照新的列寫對人；寫入途中被改動就停手', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const session = start(gas, bookId);
+  scan(gas, 'S0000001', session);
+  const data = grade();
+  [data[1], data[2]] = [data[2], data[1]];      // 老師把前兩列對調（排序）
+  sync(gas, session);
+  assert.equal(grade()[1][0], 'S0000002');
+  assert.equal(grade()[1][col], '', '原本第一列現在是別人，不能被寫到');
+  assert.equal(grade()[2][col], 1, '1 要跟著學號走');
+
+  // 寫入途中（備份寫完、正要寫成績簿之前）名冊又被對調：寫前複查要擋下來
+  scan(gas, 'S0000004', session);
+  const app = gas.ctx.SpreadsheetApp;
+  const originalFlush = app.flush;
+  let swapped = false;
+  app.flush = () => {
+    if (!swapped) {
+      swapped = true;
+      const rows = grade();
+      [rows[4], rows[5]] = [rows[5], rows[4]];
+    }
+  };
+  const stopped = sync(gas, session);
+  app.flush = originalFlush;
+  assert.match(stopped.liveError, /已停止寫入/);
+  assert.match(stopped.liveError, /即時寫入已停止，簽到照常/);
+  assert.equal(grade().filter((row) => row[col] === 1).length, 1, '擋下來的那次一格都沒寫');
+  assert.equal(sync(gas, session), null, '停掉之後背景同步不再嘗試');
+  assert.equal(tick(gas, session).syncPending, false);
+  assert.equal(scan(gas, 'S0000006', session).kind, 'success', '即時寫入停了，簽到照常');
+
+  const closed = gas.as(TEACHER).call('closeSession', session.id);
+  assert.equal(closed.written, 'filled', '結束時重新讀一次成績簿，照最新的列把整欄寫完');
+  const byId = Object.fromEntries(grade().slice(1).map((row) => [row[0], row[col]]));
+  assert.deepEqual(byId, {
+    S0000001: 1, S0000002: 0, S0000003: 0, S0000004: 1, S0000005: 0, S0000006: 1, S0000007: 0, S0000008: 0,
+  });
+});
+
+test('第六輪 即時寫入：當天欄開場前就有資料、或沒有當天欄，照舊不即時寫', () => {
+  const occupied = fresh();
+  occupied.grade()[2][occupied.col] = 1;
+  const first = start(occupied.gas, occupied.bookId);
+  assert.equal(first.live, false);
+  scan(occupied.gas, 'S0000001', first);
+  assert.equal(tick(occupied.gas, first).syncPending, false);
+  assert.equal(sync(occupied.gas, first), null);
+  assert.deepEqual(column(occupied.grade(), occupied.col), ['', 1, '', '', '', '', '', '']);
+  assert.equal(occupied.gas.as(TEACHER).call('closeSession', first.id).written, 'occupied');
+  assert.deepEqual(column(occupied.grade(), occupied.col), ['', 1, '', '', '', '', '', ''], '已有資料的欄結束時也不覆蓋');
+
+  const missing = fresh();
+  missing.grade()[0][missing.col] = '2026-01-01';
+  const second = start(missing.gas, missing.bookId);
+  assert.equal(second.live, false);
+  scan(missing.gas, 'S0000001', second);
+  assert.equal(sync(missing.gas, second), null);
+  assert.equal(missing.gas.as(TEACHER).call('closeSession', second.id).written, 'missing');
+});
+
+test('第六輪 即時寫入：同一天同一門課第二場，不會把第一場寫好的欄當成自己的', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const first = start(gas, bookId);
+  scan(gas, 'S0000001', first);
+  sync(gas, first);
+  gas.as(TEACHER).call('closeSession', first.id);
+  assert.deepEqual(column(grade(), col), [1, 0, 0, 0, 0, 0, 0, 0]);
+
+  gas.advance(10 * 60_000);
+  const second = start(gas, bookId);
+  assert.equal(second.live, false, '第二場開場時這一欄已經有資料');
+  scan(gas, 'S0000002', second);
+  const closed = gas.as(TEACHER).call('closeSession', second.id);
+  assert.equal(closed.written, 'occupied');
+  assert.equal(closed.upgradeCount, 1);
+  assert.deepEqual(column(grade(), col), [1, 0, 0, 0, 0, 0, 0, 0], '第二場不自動覆蓋，要老師按補簽');
+});
+
+test('第六輪 即時寫入：背景同步搶不到鎖就讓開（回 null），不卡住老師的操作', () => {
+  const { gas, bookId, grade, col } = fresh();
+  const session = start(gas, bookId);
+  scan(gas, 'S0000001', session);
+  gas.setLockAvailable(false);
+  assert.equal(sync(gas, session), null);
+  assert.deepEqual(column(grade(), col), BLANKS);
+  gas.setLockAvailable(true);
+  assert.equal(sync(gas, session).liveSynced, 1);
+});
+
+test('第六輪 雙語：伺服器給老師頁的訊息是「中文一行、英文一行」；紀錄試算表的備註只留中文', () => {
+  const { gas, bookId, grade, col } = fresh();
+  grade()[2][col] = 1;
+  const session = start(gas, bookId);
+  const lines = session.warning.split('\n');
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /已經有資料/);
+  assert.match(lines[1], /^[\x20-\x7e\u2019]+$/, '第二行是英文');
+  assert.throws(() => gas.as(TEACHER).call('teacherMark', session.id, 'S0000001', 'yes'),
+    (err) => /請選擇出席或未到。\nChoose present or absent\./.test(err.message));
+  assert.throws(() => gas.as(mail('S0000001')).call('teacherBoot'),
+    (err) => /只有老師可以使用這項功能。\nOnly teachers can use this\./.test(err.message));
+  const note = logRows(gas, '場次')[0][12];
+  assert.match(note, /已經有資料/);
+  assert.doesNotMatch(note, /[A-Za-z]{4,}/, '試算表備註不放英文那一行');
+});
+
+test('第六輪 雙語：學生頁與老師頁的原始碼都同時有中文與英文，英文段落標了 lang="en"', () => {
+  const { gas, bookId } = fresh();
+  const session = start(gas, bookId);
+  const student = gas.as(mail('S0000001')).page({ s: session.id, k: session.code });
+  const teacher = gas.as(TEACHER).page({});
+  for (const [zh, en] of [['簽到成功', 'Checked in'], ['你已經簽到了', 'Already checked in'],
+    ['這場點名已經結束', 'This roll call has closed'], ['請改用東華 Google 帳號', 'NDHU Google account']]) {
+    assert.ok(student.includes(zh), `學生頁少了「${zh}」`);
+    assert.ok(student.includes(en), `學生頁少了「${en}」`);
+  }
+  for (const [zh, en] of [['開始點名', 'Start roll call'], ['結束點名', 'End roll call'],
+    ['已簽到', 'Checked in'], ['成績簿即時更新', 'Gradebook live']]) {
+    assert.ok(teacher.includes(zh), `老師頁少了「${zh}」`);
+    assert.ok(teacher.includes(en), `老師頁少了「${en}」`);
+  }
+  assert.match(student, /lang="en"/);
+  assert.match(teacher, /lang="en"/);
+  assert.match(teacher, /syncLive/, '老師頁要會在背景呼叫 syncLive');
+});
+
+test('第六輪 效能：每個動作碰 Google 服務的次數有上限（真環境每一次都是 0.05–0.4 秒的往返）', () => {
+  const { gas, bookId } = fresh();
+  let used = gas.countCalls();
+  gas.as(TEACHER).call('teacherBoot');
+  assert.ok(used().propsRead <= 1, `老師頁開機讀屬性 ${used().propsRead} 次（原本三十幾次）`);
+
+  const session = start(gas, bookId);
+  used = gas.countCalls();
+  assert.equal(scan(gas, 'S0000001', session).kind, 'success');
+  let n = used();
+  assert.ok(n.propsRead <= 2, `學生簽到讀屬性 ${n.propsRead} 次`);
+  assert.equal(n.propsWrite, 0);
+  assert.ok(n.cacheRead <= 2, `學生簽到讀快取 ${n.cacheRead} 次`);
+  assert.ok(n.cacheWrite <= 1, `學生簽到寫快取 ${n.cacheWrite} 次`);
+  assert.ok(n.openBook <= 1, `學生簽到開試算表 ${n.openBook} 次`);
+  assert.equal(n.lock, 0, '學生簽到不排鎖');
+  assert.equal(n.flush, 0, '學生簽到不強制送出');
+
+  used = gas.countCalls();
+  assert.equal(scan(gas, 'S0000001', session).kind, 'duplicate');
+  n = used();
+  assert.ok(n.propsRead <= 1 && n.cacheRead <= 1 && n.openBook === 0, `重複掃要更輕：${JSON.stringify(n)}`);
+
+  used = gas.countCalls();
+  tick(gas, session);
+  n = used();
+  assert.ok(n.propsRead <= 1, `輪詢讀屬性 ${n.propsRead} 次`);
+  assert.equal(n.propsWrite + n.cacheWrite + n.lock + n.flush, 0, `輪詢只讀不寫：${JSON.stringify(n)}`);
+
+  gas.as(TEACHER).call('closeSession', session.id);
+  used = gas.countCalls();
+  gas.as(TEACHER).call('sessionRoster', session.id);
+  n = used();
+  assert.ok(n.openBook <= 1, `結束後看名單只開紀錄表，不重讀成績簿（開了 ${n.openBook} 本）`);
+
+  used = gas.countCalls();
+  mark(gas, session, 'S0000002', true);
+  n = used();
+  assert.ok(n.propsRead <= 2, `改一位學生讀屬性 ${n.propsRead} 次`);
+  assert.ok(n.propsWrite <= 3, `改一位學生寫屬性 ${n.propsWrite} 次`);
+  assert.equal(n.cacheWrite, 0, `改一位學生不寫快取（原本每存一次場次就多寫一次）：${n.cacheWrite}`);
+  assert.ok(n.flush <= 4, `改一位學生強制送出 ${n.flush} 次`);
+});
+

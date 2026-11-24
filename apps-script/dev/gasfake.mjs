@@ -262,6 +262,7 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
   function getLock() {
     const lock = {
       tryLock() {
+        calls.lock++;
         if (!lockAvailable || (lockOwner && lockOwner !== lock)) return false;
         lockOwner = lock;
         return true;
@@ -278,18 +279,27 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
   }
 
   const store = {
-    getProperty: (key) => props.get(key) ?? null,
-    getProperties: () => Object.fromEntries(props),
+    getProperty(key) {
+      calls.propsRead++;
+      return props.get(key) ?? null;
+    },
+    getProperties() {
+      calls.propsRead++;
+      return Object.fromEntries(props);
+    },
     setProperty(key, value) {
+      calls.propsWrite++;
       props.set(key, String(value));
       return store;
     },
     setProperties(values, replace = false) {
+      calls.propsWrite++;
       if (replace) props.clear();
-      Object.entries(values).forEach(([key, value]) => store.setProperty(key, value));
+      Object.entries(values).forEach(([key, value]) => props.set(key, String(value)));
       return store;
     },
     deleteProperty(key) {
+      calls.propsWrite++;
       props.delete(key);
       return store;
     },
@@ -299,14 +309,27 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
     },
   };
 
+  // 各服務被呼叫的次數：真環境每一次都是一趟往返，效能回歸測試靠這個數字守。
+  const calls = { propsRead: 0, propsWrite: 0, cacheRead: 0, cacheWrite: 0, openBook: 0, lock: 0, flush: 0 };
   const scriptCache = {
+    getAll(keys) {
+      calls.cacheRead++;
+      const found = {};
+      keys.forEach((key) => {
+        const entry = cache.get(key);
+        if (entry && entry.expiresAt > now()) found[key] = entry.value;
+      });
+      return found;
+    },
     get(key) {
+      calls.cacheRead++;
       const entry = cache.get(key);
       if (entry && entry.expiresAt > now()) return entry.value;
       cache.delete(key);
       return null;
     },
     put(key, value, seconds = 600) {
+      calls.cacheWrite++;
       cache.set(key, { value: String(value), expiresAt: now() + seconds * 1000 });
     },
     remove: (key) => cache.delete(key),
@@ -316,8 +339,13 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
     Date: GasDate,
     SpreadsheetApp: {
       create: createBook,
-      openById: (id) => lookup(books, id, '試算表'),
-      flush() {},
+      openById(id) {
+        calls.openBook++;
+        return lookup(books, id, '試算表');
+      },
+      flush() {
+        calls.flush++;
+      },
     },
     DriveApp: {
       createFolder: (name) => createFolder(`FAKE_GRADE_FOLDER_${++folderSequence}`, name),
@@ -359,8 +387,13 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
     vm.runInContext(readFileSync(resolve(APP_DIR, filename), 'utf8'), context, { filename });
   }
   return {
-    ctx: context, props, books, cache,
+    ctx: context, props, books, cache, calls,
     now,
+    // 把計數歸零，回傳一個「到目前為止用了幾次」的讀數函式。
+    countCalls() {
+      Object.keys(calls).forEach((key) => { calls[key] = 0; });
+      return () => ({ ...calls });
+    },
     setNow(ms) {
       if (!Number.isFinite(ms)) throw new Error('測試時間必須是毫秒數');
       currentTime = ms;
@@ -378,10 +411,12 @@ export function makeGas({ nowMs, serviceUrl = 'http://127.0.0.1:8918/', effectiv
     },
     call(name, ...args) {
       if (typeof context[name] !== 'function') throw new Error(`找不到 Apps Script 函式：${name}`);
+      context.resetExecution_();   // 真環境每次執行都是全新的全域狀態
       const result = context[name](...args);
       return result === undefined ? null : JSON.parse(JSON.stringify(result));
     },
     page(parameter = {}) {
+      context.resetExecution_();
       return context.doGet({ parameter }).getContent();
     },
     sheet(name, id = props.get('LOG_SHEET_ID')) {

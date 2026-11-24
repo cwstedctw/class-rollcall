@@ -1,4 +1,8 @@
 const DEFAULT_OPTIONS_ = { durationMin: 5, rotateSec: 20, lateAfterMin: 0 };
+// 指令碼屬性的快照：一次執行（一個網頁請求或一次老師操作）只讀一次，之後都從這裡拿。
+// 讀寫屬性每次約 0.05–0.15 秒（2026-11-24 實測），老師頁開機原本要讀三十幾次。
+// 等過鎖、睡過、或隔了一段時間要再確認場次狀態之前，先呼叫 staleProps_() 讓它重讀。
+let propsSnapshot_ = null;
 const WRONG_CODE_TTL_SEC_ = 600;
 const LOG_HEADERS_ = {
   '場次': ['場次ID', '成績簿名稱', '成績簿ID', '日期', '開始時間', '結束時間', 'QR秒數', '遲到分鐘', '狀態', '名冊人數', '簽到人數', '寫入結果', '備註'],
@@ -66,13 +70,13 @@ function teacherBoot() {
     // 老師頁用這個數字決定要不要出現「清掉測試場次」按鈕。
     testSessionCount: closed.filter(s => demoIds.has(s.bookId)).length,
     defaults: readOptions_(),
-    needsGradeFolder: !props_().getProperty('GRADE_FOLDER_ID'),
+    needsGradeFolder: !prop_('GRADE_FOLDER_ID'),
   });
 }
 
 // 測試用成績簿（createDemoBook 建的那個資料夾裡的試算表）的 ID。
 function demoBookIds_(refresh) {
-  const folderId = props_().getProperty('DEMO_GRADE_FOLDER_ID');
+  const folderId = prop_('DEMO_GRADE_FOLDER_ID');
   if (!folderId) return new Set();
   try {
     return new Set(coursesInFolder_(folderId, refresh).map(course => course.id));
@@ -90,17 +94,13 @@ function clearTestSessions() {
     const keep = [];
     const removed = [];
     idList_('recent_ids').forEach(id => {
-      const session = readSession_(id, true);
+      const session = readSession_(id);
       if (session && session.status === 'closed' && demoIds.has(session.bookId)) removed.push(id);
       else keep.push(id);
     });
     if (removed.length) {
-      const p = props_();
-      p.setProperty('recent_ids', JSON.stringify(keep));
-      removed.forEach(id => {
-        p.deleteProperty('sess_' + id);
-        try { CacheService.getScriptCache().remove('sess_' + id); } catch (err) { /* 快取清不掉沒關係 */ }
-      });
+      setProps_({ recent_ids: JSON.stringify(keep) });
+      removed.forEach(id => deleteProp_('sess_' + id));
     }
     return { removed: removed.length };
   });
@@ -111,14 +111,17 @@ function saveGradeFolder(urlOrId) {
   const input = String(urlOrId || '').trim();
   const url = input.match(/^https:\/\/drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?)?folders\/([\w-]+)(?:[/?#].*)?$/i);
   const id = url ? url[1] : input;
-  if (!/^[\w-]{1,150}$/.test(id)) throw new Error('請輸入 Google 雲端硬碟的資料夾網址或 ID。');
+  if (!/^[\w-]{1,150}$/.test(id)) {
+    throw new Error(bi_('請輸入 Google 雲端硬碟的資料夾網址或 ID。', 'Enter a Google Drive folder URL or ID.'));
+  }
   return locked_(() => {
     try {
       coursesInFolder_(id, true);
     } catch (err) {
-      throw new Error('無法讀取成績簿資料夾，請確認網址和存取權限。');
+      throw new Error(bi_('無法讀取成績簿資料夾，請確認網址和存取權限。',
+        'Can\u2019t read that gradebook folder. Check the URL and sharing permissions.'));
     }
-    props_().setProperty('GRADE_FOLDER_ID', id);
+    setProps_({ GRADE_FOLDER_ID: id });
     return courseCatalog_();
   });
 }
@@ -129,10 +132,12 @@ function startSession(bookId, opts) {
 
   return locked_(() => {
     const course = courseCatalog_().courses.find(item => item.id === bookId);
-    if (!course) throw new Error('請選擇成績簿清單中的課程。');
+    if (!course) throw new Error(bi_('請選擇成績簿清單中的課程。', 'Choose a course from the gradebook list.'));
     const existing = openSessions_().find(s => s.bookId === bookId);
     if (existing) {
-      if (sessionPhase_(existing, Date.now()) === 'open') throw new Error('這門課已經有一場點名。');
+      if (sessionPhase_(existing, Date.now()) === 'open') {
+        throw new Error(bi_('這門課已經有一場點名。', 'This course already has an open roll call.'));
+      }
       closeSessionLocked_(existing);
     }
 
@@ -142,13 +147,18 @@ function startSession(bookId, opts) {
     const grade = readGrade_(bookId, date);
     const roster = rosterFromRows_(grade.rows);
     const initial = planColumnWrite_(grade.header, grade.rows, date, {});
-    let warning = '';
+    const warnings = [];
     if (initial.kind === 'missing') {
-      warning = '成績簿沒有今天這一欄，照樣可以點名，結果只留在紀錄表。';
+      warnings.push(bi_('成績簿沒有今天這一欄，照樣可以點名，結果只留在紀錄表。',
+        'The gradebook has no column for today. Roll call still works; results stay in the roll-call log.'));
     } else if (initial.kind === 'occupied') {
-      warning = '今天這欄已經有資料，結束時不會覆蓋。';
+      warnings.push(bi_('今天這欄已經有資料，結束時不會覆蓋。',
+        'Today’s column already has data. It will not be overwritten when roll call ends.'));
     }
-    if (roster.dup.length) warning += (warning ? ' ' : '') + '名冊有重複學號，簽到與寫入以第一筆為準。';
+    if (roster.dup.length) {
+      warnings.push(bi_('名冊有重複學號，簽到與寫入以第一筆為準。',
+        'The roster has duplicate student IDs. Check-ins and writes use the first one.'));
+    }
 
     const session = {
       id: Utilities.getUuid(),
@@ -166,7 +176,12 @@ function startSession(bookId, opts) {
       logBookId: log.getId(),
       checkinStartRow: log.getSheetByName('簽到').getLastRow() + 1,
       logStartRow: log.getSheetByName('場次').getLastRow() + 1,
-      warning,
+      warning: warnings.join('\n'),
+      // 當天那一欄整欄空白，這一場就邊點名邊寫成績簿（2026-11-24 Ted：immediate update google sheet）。
+      // 欄位不存在或已經有資料，照舊：不即時寫，結束時也不覆蓋。
+      live: initial.kind === 'fill',
+      liveSig: liveSignature_(roster.list, {}, new Set()),
+      liveSynced: 0,
     };
     log.getSheetByName('場次').appendRow(sessionLogRow_(session));
     SpreadsheetApp.flush();
@@ -174,7 +189,7 @@ function startSession(bookId, opts) {
       open_ids: JSON.stringify(idList_('open_ids').concat(session.id)),
       rollcall_options: JSON.stringify(settings),
     });
-    cachePut_('roster_' + session.id, roster.list);
+    cacheRoster_(session, roster.list);
     return sessionView_(session, 0);
   });
 }
@@ -188,10 +203,68 @@ function teacherTick(sessionId) {
   return sessionView_(session);
 }
 
+// 老師頁在背景呼叫：把還沒進成績簿的簽到寫進去（即時寫入）。
+// 簽到那條路不寫成績簿——學生掃碼要快，而且同時好幾個人寫同一欄不安全；統一由這裡排鎖、一次寫。
+// 回傳 null＝這次沒做（別的老師操作正在進行、場次已結束、或這一場不是即時寫入），老師頁下一輪再問。
+function syncLive(sessionId) {
+  requireTeacher_();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1500)) return null;
+  try {
+    staleProps_();
+    const session = requiredSession_(sessionId);
+    if (!session.live || session.liveStopped || sessionPhase_(session, Date.now()) !== 'open') return null;
+    return sessionView_(session, liveSync_(session));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// 把「紀錄表上已經出席或被老師取消、成績簿還沒跟上」的格子寫進成績簿。呼叫的人要先拿到指令碼鎖。
+// 只會動當天那一欄、名冊上的列：出席→1、老師取消→0，其他格子不碰。回傳名冊上目前的出席人數。
+function liveSync_(session) {
+  const checkins = readCheckins_(session, sessionLogBook_(session));
+  const present = presentSet_(checkins);
+  const cancelled = cancelledSids_(checkins);
+  let roster = rosterFor_(session);
+  try {
+    const grade = readGrade_(session.bookId, session.date);
+    if (grade.col < 0) {
+      throw gradeWriteError_(bi_('成績簿的日期欄已變更。', 'The date column in the gradebook has changed.'));
+    }
+    roster = rosterFromRows_(grade.rows).list;
+    cacheRoster_(session, roster);
+    const plan = liveChanges_(grade.rows, grade.col, roster, present, cancelled, false);
+    writeGradeColumn_(session, grade, plan.changes, 'live');
+    session.liveSig = liveSignature_(roster, present, cancelled);
+    session.liveSynced = plan.ones;
+    // 格子裡已經是別的內容而沒寫的格數：投影頁要講出來，不然老師不知道有人沒寫進去（立霧複驗 #5）。
+    session.liveBlocked = plan.blocked.length;
+    session.liveError = '';
+    session.liveFails = 0;
+    session.mismatches = [];
+  } catch (err) {
+    // 成績簿被改動（欄位、名冊、格子內容）就停掉這一場的即時寫入；偶發的讀寫錯誤連續三次才停。
+    // 停掉不影響簽到，結束點名時仍會做一次完整的寫入與回讀。
+    session.liveFails = (session.liveFails || 0) + 1;
+    if (err.rollcallWrite || session.liveFails >= 3) {
+      session.liveStopped = true;
+      session.liveError = [
+        err.rollcallWrite ? err.message
+          : bi_('即時寫入成績簿時發生錯誤。', 'Something went wrong while updating the gradebook live.'),
+        bi_('即時寫入已停止，簽到照常；結束點名時會再寫一次。',
+          'Live update has stopped. Check-in still works; the gradebook is written again when roll call ends.'),
+      ].join('\n');
+    }
+  }
+  storeSession_(session);
+  return summary_(roster, present).present;
+}
+
 function extendSession(sessionId, minutes) {
   requireTeacher_();
   if (!Number.isInteger(minutes) || minutes < 1 || minutes > 180) {
-    throw new Error('延長時間請輸入 1 到 180 分鐘。');
+    throw new Error(bi_('延長時間請輸入 1 到 180 分鐘。', 'Extension must be 1 to 180 minutes.'));
   }
   return locked_(() => {
     const session = requiredSession_(sessionId);
@@ -232,13 +305,17 @@ function sessionRoster(sessionId) {
 
 function teacherMark(sessionId, sid, present) {
   requireTeacher_();
-  if (typeof present !== 'boolean') throw new Error('請選擇出席或未到。');
+  if (typeof present !== 'boolean') throw new Error(bi_('請選擇出席或未到。', 'Choose present or absent.'));
   return locked_(() => {
     const session = requiredSession_(sessionId);
     if (sessionPhase_(session, Date.now()) === 'expired') closeSessionLocked_(session);
-    const roster = rosterFor_(session);
-    const student = roster.find(person => person.sid === normSid_(sid));
-    if (!student) throw new Error('找不到這位學生。');
+    let roster = rosterFor_(session);
+    let student = roster.find(person => person.sid === normSid_(sid));
+    if (!student) {
+      roster = rosterFor_(session, true);
+      student = roster.find(person => person.sid === normSid_(sid));
+    }
+    if (!student) throw new Error(bi_('找不到這位學生。', 'Student not found.'));
 
     const written = session.written;
     const action = present ? '老師補登' : '老師取消';
@@ -251,15 +328,28 @@ function teacherMark(sessionId, sid, present) {
       const key = checkinCacheKey_(session.id, student.sid);
       if (present) rememberFirstCheckin_(key, markedAt, true);
       else cachePut_(key, 'cancelled');
+      // 場次還開著：只記這一筆就回去，按鈕不必等成績簿（真環境實測當場寫要 5 秒）。
+      // 回傳的畫面資料會帶 syncPending，老師頁隨即在背景把這一格寫進成績簿；場次摘要留到結束時一起更新。
+      return sessionView_(session);
     }
-    const checkins = readCheckins_(session, log);
-    const presentRecords = presentSet_(checkins);
+    const presentRecords = presentSet_(readCheckins_(session, log));
     session.presentCount = summary_(roster, presentRecords).present;
     if (written === 'filled' || written === 'topped') {
       writeAttempt_(session, () => {
         const grade = readGrade_(session.bookId, session.date);
         const current = rosterFromRows_(grade.rows).list.find(person => person.sid === student.sid);
-        if (!current || grade.col < 0) throw gradeWriteError_('成績簿名冊或日期欄已變更，簽到紀錄已保留。');
+        if (!current || grade.col < 0) {
+          throw gradeWriteError_(bi_('成績簿名冊或日期欄已變更，簽到紀錄已保留。',
+            'The gradebook roster or date column has changed. The check-in record was kept.'));
+        }
+        session.written = written;
+        if (cellState_(grade.rows[current.row][grade.col]) === 'other') {
+          // 那一格是老師寫的字或公式：簽到紀錄已經記了，成績簿這一格留給老師自己改。
+          session.mismatches = [current.row + 2];
+          return bi_('這位學生那一格已經是別的內容，沒有覆蓋；紀錄已記下，請直接在試算表核對。',
+            'That cell already holds other content and was left as is. The record was saved; please check the spreadsheet.');
+        }
+        session.written = 'error';
         writeGradeColumn_(session, grade, [{ row: current.row, value: present ? 1 : 0 }], 'mark');
         session.written = written;
       });
@@ -293,11 +383,10 @@ function applyTopUp(sessionId) {
 function createDemoBook() {
   const teacherEmail = requireTeacher_();
   return locked_(() => {
-    const p = props_();
-    let folderId = p.getProperty('DEMO_GRADE_FOLDER_ID');
+    let folderId = prop_('DEMO_GRADE_FOLDER_ID');
     if (!folderId) {
       folderId = DriveApp.createFolder('課堂點名測試成績簿').getId();
-      p.setProperty('DEMO_GRADE_FOLDER_ID', folderId);
+      setProps_({ DEMO_GRADE_FOLDER_ID: folderId });
     }
     const folder = DriveApp.getFolderById(folderId);
     const book = SpreadsheetApp.create('點名網頁測試用成績簿');
@@ -332,6 +421,32 @@ function props_() {
   return PropertiesService.getScriptProperties();
 }
 
+function prop_(key) {
+  if (!propsSnapshot_) propsSnapshot_ = props_().getProperties();
+  const value = propsSnapshot_[key];
+  return value == null ? null : value;
+}
+
+// 別的執行可能改過屬性（例如學生簽到途中老師按了結束）：要看最新狀態之前先丟掉快照。
+function staleProps_() {
+  propsSnapshot_ = null;
+}
+
+function setProps_(values) {
+  props_().setProperties(values);
+  if (propsSnapshot_) Object.keys(values).forEach(key => { propsSnapshot_[key] = String(values[key]); });
+}
+
+function deleteProp_(key) {
+  props_().deleteProperty(key);
+  if (propsSnapshot_) delete propsSnapshot_[key];
+}
+
+// 本機測試用：假環境的每一次呼叫等於一次新的執行，要從乾淨的狀態開始。
+function resetExecution_() {
+  propsSnapshot_ = null;
+}
+
 function activeEmail_() {
   return String(Session.getActiveUser().getEmail() || '').trim().toLowerCase();
 }
@@ -339,22 +454,23 @@ function activeEmail_() {
 function isTeacher_(email) {
   if (!sidFromEmail_(email)) return false;
   const owner = String(Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
-  const configured = (props_().getProperty('TEACHER_EMAILS') || '').split(',')
+  const configured = (prop_('TEACHER_EMAILS') || '').split(',')
     .map(item => item.trim().toLowerCase());
   return email === owner || configured.includes(email);
 }
 
 function requireTeacher_() {
   const email = activeEmail_();
-  if (!isTeacher_(email)) throw new Error('只有老師可以使用這項功能。');
+  if (!isTeacher_(email)) throw new Error(bi_('只有老師可以使用這項功能。', 'Only teachers can use this.'));
   return email;
 }
 
 function locked_(action) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(20000)) {
-    throw new Error('系統忙線，請再試一次。');
+    throw new Error(bi_('系統忙線，請再試一次。', 'The system is busy. Please try again.'));
   }
+  staleProps_();
   try {
     return action();
   } finally {
@@ -379,6 +495,18 @@ function cachePut_(key, value, seconds = 21600) {
   }
 }
 
+// 一次往返拿好幾個快取值（學生簽到那條路每省一次往返約 0.02–0.05 秒）。拿不到的鍵不會出現在結果裡。
+function cacheGetAll_(keys) {
+  const found = {};
+  try {
+    const values = CacheService.getScriptCache().getAll(keys);
+    Object.keys(values).forEach(key => { found[key] = JSON.parse(values[key]); });
+  } catch (err) {
+    // 快取讀不到就當成都沒有，後面各自回到原始資料。
+  }
+  return found;
+}
+
 function coursesInFolder_(id, refresh) {
   const key = 'courses_' + id;
   if (!refresh) {
@@ -396,15 +524,15 @@ function coursesInFolder_(id, refresh) {
 }
 
 function courseCatalog_() {
-  const p = props_();
-  const folders = [p.getProperty('GRADE_FOLDER_ID'), p.getProperty('DEMO_GRADE_FOLDER_ID')].filter(Boolean);
+  const folders = [prop_('GRADE_FOLDER_ID'), prop_('DEMO_GRADE_FOLDER_ID')].filter(Boolean);
   const courses = new Map();
   let folderError = '';
   new Set(folders).forEach(id => {
     try {
       coursesInFolder_(id).forEach(course => courses.set(course.id, course));
     } catch (err) {
-      folderError = '無法讀取成績簿資料夾，請確認部署者有存取權限。';
+      folderError = bi_('無法讀取成績簿資料夾，請確認部署者有存取權限。',
+        'Can’t read the gradebook folder. Make sure the deploying account has access.');
     }
   });
   return { courses: Array.from(courses.values()).sort((a, b) => a.name.localeCompare(b.name, 'zh-TW')), folderError };
@@ -414,61 +542,52 @@ function options_(opts) {
   const settings = Object.assign({}, DEFAULT_OPTIONS_, opts);
   const { durationMin, rotateSec, lateAfterMin } = settings;
   if (!Number.isInteger(durationMin) || durationMin < 1 || durationMin > 180) {
-    throw new Error('開放時間請輸入 1 到 180 分鐘。');
+    throw new Error(bi_('開放時間請輸入 1 到 180 分鐘。', 'Open time must be 1 to 180 minutes.'));
   }
-  if (![0, 20, 60].includes(rotateSec)) throw new Error('請選擇 QR 的輪換秒數。');
-  if (!Number.isSafeInteger(lateAfterMin) || lateAfterMin < 0) throw new Error('遲到分鐘數請輸入非負整數。');
+  if (![0, 20, 60].includes(rotateSec)) {
+    throw new Error(bi_('請選擇 QR 的輪換秒數。', 'Choose how often the QR refreshes.'));
+  }
+  if (!Number.isSafeInteger(lateAfterMin) || lateAfterMin < 0) {
+    throw new Error(bi_('遲到分鐘數請輸入非負整數。', 'Late-after minutes must be 0 or a positive whole number.'));
+  }
   return { durationMin, rotateSec, lateAfterMin };
 }
 
 function readOptions_() {
-  const saved = props_().getProperty('rollcall_options');
+  const saved = prop_('rollcall_options');
   return saved ? options_(JSON.parse(saved)) : Object.assign({}, DEFAULT_OPTIONS_);
 }
 
 function idList_(key) {
-  return JSON.parse(props_().getProperty(key) || '[]');
+  return JSON.parse(prop_(key) || '[]');
 }
 
-function readSession_(id, fresh) {
+function readSession_(id) {
   if (typeof id !== 'string' || !/^[\w-]{1,100}$/.test(id)) return null;
-  const key = 'sess_' + id;
-  const saved = fresh ? null : cacheGet_(key);
-  if (saved) return saved;
-  const raw = props_().getProperty(key);
-  if (!raw) return null;
-  const session = JSON.parse(raw);
-  if (!fresh) cachePut_(key, session);
-  return session;
+  const raw = prop_('sess_' + id);
+  return raw ? JSON.parse(raw) : null;
 }
 
 function storeSession_(session, extra) {
-  const key = 'sess_' + session.id;
-  props_().setProperties(Object.assign({ [key]: JSON.stringify(session) }, extra || {}));
-  cachePut_(key, session);
+  setProps_(Object.assign({ ['sess_' + session.id]: JSON.stringify(session) }, extra || {}));
 }
 
 function requiredSession_(id) {
-  const session = readSession_(id, true);
-  if (!session) throw new Error('找不到這場點名。');
+  const session = readSession_(id);
+  if (!session) throw new Error(bi_('找不到這場點名。', 'Roll call not found.'));
   return session;
 }
 
 function openSessions_() {
-  const snapshot = props_().getProperties();
-  return JSON.parse(snapshot.open_ids || '[]')
-    .map(id => snapshot['sess_' + id]).filter(Boolean)
-    .map(value => JSON.parse(value)).filter(s => s.status === 'open');
+  return idList_('open_ids').map(id => readSession_(id)).filter(s => s && s.status === 'open');
 }
 
 function recentSessions_() {
-  return idList_('recent_ids').map(id => readSession_(id, true))
-    .filter(s => s && s.status === 'closed');
+  return idList_('recent_ids').map(id => readSession_(id)).filter(s => s && s.status === 'closed');
 }
 
 function logBook_(create) {
-  const p = props_();
-  const id = p.getProperty('LOG_SHEET_ID');
+  const id = prop_('LOG_SHEET_ID');
   if (id) {
     try {
       const book = SpreadsheetApp.openById(id);
@@ -478,7 +597,7 @@ function logBook_(create) {
       if (!create) throw err;
     }
   }
-  if (!create) throw new Error('點名紀錄尚未建立。');
+  if (!create) throw new Error(bi_('點名紀錄尚未建立。', 'The roll-call log has not been created yet.'));
   const book = SpreadsheetApp.create('課堂點名紀錄（點名網頁資料）');
   book.setSpreadsheetTimeZone('Asia/Taipei');
   Object.keys(LOG_HEADERS_).forEach((name, i) => {
@@ -487,7 +606,7 @@ function logBook_(create) {
     sheet.setFrozenRows(1);
   });
   SpreadsheetApp.flush();
-  p.setProperty('LOG_SHEET_ID', book.getId());
+  setProps_({ LOG_SHEET_ID: book.getId() });
   return book;
 }
 
@@ -496,12 +615,15 @@ function sessionLogBook_(session) {
   // Sessions created before this field was added can still verify their summary row.
   const matches = session.logBookId ? session.logBookId === book.getId()
     : book.getSheetByName('場次').getRange(session.logStartRow, 1).getValue() === session.id;
-  if (!matches) throw gradeWriteError_('這場的點名紀錄試算表已更換，請先核對原本的紀錄。');
+  if (!matches) {
+    throw gradeWriteError_(bi_('這場的點名紀錄試算表已更換，請先核對原本的紀錄。',
+      'The roll-call log for this session has been replaced. Check the original log first.'));
+  }
   return book;
 }
 
 function sessionLogRow_(session) {
-  const note = [session.warning, session.error].filter(Boolean).join(' ');
+  const note = [session.warning, session.error, session.liveError].filter(Boolean).map(zhOnly_).join(' ');
   return [
     session.id, safeCell_(session.bookName), session.bookId, session.date, new Date(session.openedAtMs),
     new Date(session.closesAtMs), session.rotateSec, session.lateAfterMin, session.status,
@@ -513,7 +635,7 @@ function updateSessionLog_(session) {
   const sheet = logBook_(false).getSheetByName('場次');
   const row = sessionLogRow_(session);
   if (sheet.getRange(session.logStartRow, 1).getValue() !== session.id) {
-    throw new Error('場次紀錄已移動，請先檢查點名紀錄。');
+    throw new Error(bi_('場次紀錄已移動，請先檢查點名紀錄。', 'The session row has moved. Check the roll-call log first.'));
   }
   sheet.getRange(session.logStartRow, 1, 1, row.length).setValues([row]);
   SpreadsheetApp.flush();
@@ -534,11 +656,12 @@ function finishSessionUpdate_(session) {
 
 function readGrade_(bookId, date) {
   const sheet = SpreadsheetApp.openById(bookId).getSheetByName('點名');
-  if (!sheet) throw new Error('成績簿缺少「點名」分頁。');
+  if (!sheet) throw new Error(bi_('成績簿缺少「點名」分頁。', 'The gradebook has no "點名" (roll call) tab.'));
   const all = sheet.getDataRange().getValues();
   const header = all[0] || [];
   if (String(header[0]).trim() !== '學號' || String(header[1]).trim() !== '姓名') {
-    throw new Error('「點名」分頁前兩欄必須是「學號」和「姓名」。');
+    throw new Error(bi_('「點名」分頁前兩欄必須是「學號」和「姓名」。',
+      'The first two columns of the "點名" tab must be "學號" (student ID) and "姓名" (name).'));
   }
   const rows = all.slice(1);
   const col = findDateColumn_(header, date);
@@ -552,15 +675,19 @@ function readGrade_(bookId, date) {
   return { sheet, header, rows, col };
 }
 
-function rosterFor_(session) {
+function rosterFor_(session, fresh) {
   const key = 'roster_' + session.id;
-  if (session.status === 'open') {
-    const saved = cacheGet_(key);
-    if (saved) return saved;
-  }
+  const saved = fresh ? null : cacheGet_(key);
+  if (saved) return saved;
   const roster = rosterFromRows_(readGrade_(session.bookId, session.date).rows).list;
-  if (session.status === 'open') cachePut_(key, roster);
+  cacheRoster_(session, roster);
   return roster;
+}
+
+// 場次開著時名冊快取放久一點（背景同步每次都會換成最新的）；結束後只留 10 分鐘，
+// 老師下課後在成績簿加人、改學號，最慢 10 分鐘後老師頁就看得到（立霧複驗 2026-11-24）。
+function cacheRoster_(session, roster) {
+  cachePut_('roster_' + session.id, roster, session.status === 'open' ? 21600 : 600);
 }
 
 function readCheckins_(session, book = logBook_(false)) {
@@ -585,7 +712,9 @@ function topUpRows_(grade, plan, present) {
 
 function writeTopUp_(session, grade, present) {
   const placement = planColumnWrite_(grade.header, grade.rows, session.date, present);
-  if (placement.kind === 'missing') throw gradeWriteError_('成績簿的日期欄已變更。');
+  if (placement.kind === 'missing') {
+    throw gradeWriteError_(bi_('成績簿的日期欄已變更。', 'The date column in the gradebook has changed.'));
+  }
   const rows = topUpRows_(grade, placement, present);
   writeGradeColumn_(session, grade, rows.map(row => ({ row, value: 1 })), 'topUp');
 }
@@ -613,11 +742,16 @@ function sessionView_(s, count) {
   const base = publicUrls_(serviceUrl_()).generic;
   const join = base.includes('?') ? '&' : '?';
   let presentCount = count;
+  // 有簽到還沒寫進成績簿：老師頁看到這個旗標就在背景呼叫 syncLive。
+  let syncPending = false;
   if (presentCount === undefined) {
     presentCount = s.presentCount || 0;
     if (s.status === 'open') {
       const { roster, checkins } = sessionRecords_(s);
-      presentCount = summary_(roster, presentSet_(checkins)).present;
+      const present = presentSet_(checkins);
+      presentCount = summary_(roster, present).present;
+      syncPending = Boolean(s.live) && !s.liveStopped && open &&
+        liveSignature_(roster, present, cancelledSids_(checkins)) !== s.liveSig;
     }
   }
   return {
@@ -627,12 +761,15 @@ function sessionView_(s, count) {
     qrUrl: open && base ? base + join + 's=' + encodeURIComponent(s.id) + '&k=' + encodeURIComponent(code) : '',
     status: s.status, written: s.written, rosterCount: s.rosterCount, presentCount,
     upgradeCount: s.upgradeCount || 0, warning: s.warning || '', mismatches: s.mismatches || [],
-    error: [s.error, s.logPending && '場次摘要待同步到點名紀錄。'].filter(Boolean).join(' '),
+    live: Boolean(s.live), syncPending, liveSynced: s.liveSynced || 0, liveError: s.liveError || '',
+    liveBlocked: s.liveBlocked || 0, keptManual: s.keptManual || 0,
+    error: [s.error, s.logPending && bi_('場次摘要待同步到點名紀錄。',
+      'The session summary is waiting to sync to the roll-call log.')].filter(Boolean).join('\n'),
   };
 }
 
 function serviceUrl_() {
-  const url = props_().getProperty('PUBLIC_URL') || ScriptApp.getService().getUrl() || '';
+  const url = prop_('PUBLIC_URL') || ScriptApp.getService().getUrl() || '';
   return url.split('#')[0];
 }
 
@@ -683,7 +820,7 @@ function checkInForSession_(email, id, code) {
   const sid = sidFromEmail_(email);
   if (!sid) return studentResult_('unauthorized');
 
-  const session = readSession_(id, true);
+  const session = readSession_(id);
   const now = Date.now();
   if (!session || sessionPhase_(session, now) !== 'open') return closedResult_(session);
   if (!checkCode_(code, session, now, hmac_).ok) {
@@ -693,9 +830,13 @@ function checkInForSession_(email, id, code) {
 }
 
 function recordStudentCheckin_(session, email, sid, source) {
-  if (wrongCodeCount_(session.id, sid) > 10) return studentResult_('rateLimited');
   const key = checkinCacheKey_(session.id, sid);
-  const remembered = cacheGet_(key);
+  const wrongKey = wrongCodeKey_(session.id, sid);
+  const rosterKey = 'roster_' + session.id;
+  // 打錯次數、有沒有簽過、名冊：三個快取一次拿（原本分三次往返）。
+  const cached = cacheGetAll_([wrongKey, key, rosterKey]);
+  if ((cached[wrongKey] || 0) > 10) return studentResult_('rateLimited');
+  const remembered = cached[key];
   const details = { bookName: session.bookName, date: session.date };
   if (remembered === 'cancelled') return studentResult_('cancelled');
   if (typeof remembered === 'number') {
@@ -704,12 +845,14 @@ function recordStudentCheckin_(session, email, sid, source) {
   if (remembered === 'notInRoster') {
     return studentResult_(isTeacher_(email) ? 'teacherTest' : 'notInRoster');
   }
-  const student = rosterFor_(session).find(person => person.sid === sid);
+  const roster = Array.isArray(cached[rosterKey]) ? cached[rosterKey] : rosterFor_(session);
+  const student = roster.find(person => person.sid === sid);
   if (!student && isTeacher_(email)) return studentResult_('teacherTest');
 
   const sheet = sessionLogBook_(session).getSheetByName('簽到');
   // Check the authoritative state after resolving the roster and opening the log.
-  const fresh = readSession_(session.id, true);
+  staleProps_();
+  const fresh = readSession_(session.id);
   const checkedAt = Date.now();
   if (!fresh || sessionPhase_(fresh, checkedAt) !== 'open') return closedResult_(fresh);
   const status = student ? arrivalStatus_(fresh, checkedAt) : '不在名冊';
@@ -764,32 +907,55 @@ function closeSessionLocked_(session) {
     Utilities.sleep(2500);
     const grade = readGrade_(session.bookId, session.date);
     const log = sessionLogBook_(session);
-    const present = presentSet_(readCheckins_(session, log));
+    const checkins = readCheckins_(session, log);
+    const present = presentSet_(checkins);
     const roster = rosterFromRows_(grade.rows).list;
+    cacheRoster_(session, roster);
     const counts = summary_(roster, present);
     session.rosterCount = counts.total;
     session.presentCount = counts.present;
     const plan = planColumnWrite_(grade.header, grade.rows, session.date, present);
-    session.upgradeCount = plan.kind === 'occupied' ? topUpRows_(grade, plan, present).length : 0;
-    if (plan.kind === 'fill') {
+    session.upgradeCount = 0;
+    session.keptManual = 0;
+    // 即時寫入的場次：這一欄上已經有我們自己寫的 1（與老師取消的 0），不算「已經有資料」。
+    const ownColumn = plan.kind === 'occupied' && session.live;
+    if (plan.kind !== 'fill' && !ownColumn) {
+      session.written = plan.kind;
+      if (plan.kind === 'occupied') session.upgradeCount = topUpRows_(grade, plan, present).length;
+      return '';
+    }
+
+    let blocked = [];
+    if (ownColumn) {
+      // 把這一欄補完整：出席 1、老師取消 0、其餘空白補 0；老師自己在試算表填的 1 與其他內容不動。
+      const final = liveChanges_(grade.rows, grade.col, roster, present, cancelledSids_(checkins), true);
+      writeGradeColumn_(session, grade, final.changes, 'live');
+      session.keptManual = final.kept;
+      session.liveSynced = final.ones;
+      blocked = final.blocked;
+    } else {
       const changes = roster.map(({ row }) => ({ row, value: plan.values[row][0] }));
       writeGradeColumn_(session, grade, changes, 'fill');
-      const latest = presentSet_(readCheckins_(session, log));
-      session.presentCount = summary_(roster, latest).present;
-      const arrivals = Object.fromEntries(Object.entries(latest).filter(([sid]) => !hasAttendance_(present, sid)));
-      if (roster.some(({ sid }) => hasAttendance_(arrivals, sid))) {
-        const current = readGrade_(session.bookId, session.date);
-        if (current.col !== grade.col) throw gradeWriteError_('成績簿的日期欄已變更，已停止補收。');
-        writeTopUp_(session, current, arrivals);
-      }
-      session.written = 'filled';
-    } else {
-      session.written = plan.kind;
     }
+    const latest = presentSet_(readCheckins_(session, log));
+    session.presentCount = summary_(roster, latest).present;
+    const arrivals = Object.fromEntries(Object.entries(latest).filter(([sid]) => !hasAttendance_(present, sid)));
+    if (roster.some(({ sid }) => hasAttendance_(arrivals, sid))) {
+      const current = readGrade_(session.bookId, session.date);
+      if (current.col !== grade.col) {
+        throw gradeWriteError_(bi_('成績簿的日期欄已變更，已停止補收。',
+          'The date column in the gradebook has changed. Late check-ins were not added.'));
+      }
+      writeTopUp_(session, current, arrivals);
+    }
+    session.written = 'filled';
+    if (!blocked.length) return '';
+    session.mismatches = blocked.map(row => row + 2);
+    return bi_('這一欄有 ' + blocked.length + ' 格已經是別的內容，沒有覆蓋，請核對。',
+      blocked.length + ' cell(s) in this column already held other content and were left as is. Please check.');
   }, { open_ids: JSON.stringify(open), recent_ids: JSON.stringify(recent.slice(0, 12)) });
   finishSessionUpdate_(session);
-  const p = props_();
-  recent.slice(12).forEach(id => p.deleteProperty('sess_' + id));
+  recent.slice(12).forEach(id => deleteProp_('sess_' + id));
   return sessionView_(session);
 }
 
@@ -797,16 +963,20 @@ function writeAttempt_(session, work, extra) {
   // Persist a conservative outcome before touching the gradebook. Retrying an interrupted
   // execution never assumes that its write did or did not reach Google Sheets.
   session.written = 'error';
-  session.error = '寫入作業中斷，請檢查成績簿與寫入備份。';
+  session.error = bi_('寫入作業中斷，請檢查成績簿與寫入備份。',
+    'The write was interrupted. Check the gradebook and the write backup.');
   session.mismatches = [];
   session.logPending = true;
   storeSession_(session, extra);
   try {
-    work();
-    session.error = '';
+    // work 可以回傳一句「寫完了，但有幾格要老師看一下」的提醒。
+    session.error = work() || '';
   } catch (err) {
     if (err.rollcallWrite) session.error = err.message;
-    else session.error = '寫入成績簿時發生錯誤，請檢查成績簿與寫入備份。';
+    else {
+      session.error = bi_('寫入成績簿時發生錯誤，請檢查成績簿與寫入備份。',
+        'Something went wrong while writing the gradebook. Check the gradebook and the write backup.');
+    }
   }
 }
 
@@ -819,7 +989,7 @@ function gradeWriteError_(message) {
 function writeGradeColumn_(session, grade, changes, mode) {
   if (!changes.length) return;
   const { sheet, col, rows } = grade;
-  if (col < 2) throw gradeWriteError_('找不到唯一的日期欄。');
+  if (col < 2) throw gradeWriteError_(bi_('找不到唯一的日期欄。', 'Can’t find a single column for this date.'));
   const oldValues = rows.map(row => [row[col] == null ? '' : row[col]]);
   const expected = oldValues.map(row => row.slice());
   changes.forEach(change => { expected[change.row][0] = change.value; });
@@ -833,28 +1003,31 @@ function writeGradeColumn_(session, grade, changes, mode) {
   SpreadsheetApp.flush();
 
   try {
-    const headerCell = sheet.getRange(1, col + 1);
-    const freshHeader = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    if (headerCell.getFormula() || findDateColumn_(freshHeader, session.date) !== col) {
-      throw gradeWriteError_('找不到原本那一欄的唯一日期表頭，或表頭含公式，已停止寫入。');
+    // 寫入前把整張「點名」分頁再讀一次（兩次往返：值、這一欄的公式），
+    // 確認表頭、名冊、要寫的格子都跟剛才算的時候一樣。原本分七次讀，慢了約半秒。
+    const fresh = sheet.getDataRange().getValues();
+    const formulas = sheet.getRange(1, col + 1, fresh.length, 1).getFormulas();
+    if (formulas[0][0] || findDateColumn_(fresh[0] || [], session.date) !== col) {
+      throw gradeWriteError_(bi_('找不到原本那一欄的唯一日期表頭，或表頭含公式，已停止寫入。',
+        'The date header for this column is no longer unique, or it contains a formula. Nothing was written.'));
     }
-
-    if (sheet.getLastRow() !== rows.length + 1) {
-      throw gradeWriteError_('寫入前發現成績簿列數變更，已停止寫入。');
+    if (fresh.length !== rows.length + 1) {
+      throw gradeWriteError_(bi_('寫入前發現成績簿列數變更，已停止寫入。',
+        'The number of rows in the gradebook changed. Nothing was written.'));
     }
-    const ids = sheet.getRange(2, 1, rows.length, 1).getValues();
-    const currentValues = readColumn_(sheet, col, rows.length);
+    const currentValues = rows.map((_, row) => [formulas[row + 1][0] || fresh[row + 1][col]]);
     const checkedRows = mode === 'fill' ? rows.map((_, index) => index) : changes.map(({ row }) => row);
     const changed = checkedRows.filter(row => {
       const current = currentValues[row][0];
-      return normSid_(ids[row][0]) !== normSid_(rows[row][0]) ||
+      return normSid_(fresh[row + 1][0]) !== normSid_(rows[row][0]) ||
         comparableWriteCell_(current) !== comparableWriteCell_(oldValues[row][0]) ||
         (mode === 'topUp' && !isTopUpTarget_(current)) ||
-        (mode === 'mark' && typeof current === 'string' && current.startsWith('='));
+        ((mode === 'mark' || mode === 'live') && cellState_(current) === 'other');
     });
     if (changed.length) {
       session.mismatches = changed.map(row => row + 2);
-      throw gradeWriteError_('寫入前發現成績簿名冊或日期欄資料變更，已停止寫入。');
+      throw gradeWriteError_(bi_('寫入前發現成績簿名冊或日期欄資料變更，已停止寫入。',
+        'The gradebook roster or the date column changed before writing. Nothing was written.'));
     }
 
     writeRuns_(sheet, col, changes);
@@ -863,16 +1036,19 @@ function writeGradeColumn_(session, grade, changes, mode) {
     const verified = verifyColumn_(expected.map(cells => cells.map(comparableWriteCell_)),
       actual.map(cells => cells.map(comparableWriteCell_)));
     session.mismatches = verified.mismatches.map(row => row + 2);
-    if (!verified.ok) throw gradeWriteError_('成績簿回讀不符，請查看標示的列。');
+    if (!verified.ok) {
+      throw gradeWriteError_(bi_('成績簿回讀不符，請查看標示的列。',
+        'The gradebook did not read back as written. Check the rows listed.'));
+    }
+    // 這一格跟著執行結束一起送出，不另外強制送出（省一次往返）。
     backup.getRange(backupRow, 7).setValue('相符');
   } catch (err) {
-    const result = err.rollcallWrite ? err.message : '讀寫時發生錯誤，請檢查成績簿。';
+    const result = err.rollcallWrite ? zhOnly_(err.message) : '讀寫時發生錯誤，請檢查成績簿。';
     const lines = session.mismatches.length ? ' 不符列 ' + session.mismatches.join('、') : '';
     backup.getRange(backupRow, 7).setValue(result + lines);
     SpreadsheetApp.flush();
     throw err;
   }
-  SpreadsheetApp.flush();
 }
 
 function comparableWriteCell_(value) {

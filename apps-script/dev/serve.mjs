@@ -18,7 +18,7 @@ seed(gas);
 const rpcFunctions = new Set([
   'checkInByCode', 'teacherBoot', 'saveGradeFolder', 'startSession', 'teacherTick',
   'extendSession', 'closeSession', 'sessionRoster', 'teacherMark', 'applyTopUp',
-  'createDemoBook', 'setup', 'clearTestSessions',
+  'createDemoBook', 'setup', 'clearTestSessions', 'syncLive',
 ]);
 
 function send(res, code, contentType, body) {
